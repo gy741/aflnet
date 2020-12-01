@@ -8968,6 +8968,9 @@ int main(int argc, char** argv) {
         } else if (!strcmp(optarg, "TLS")) {
           extract_requests = &extract_requests_tls;
           extract_response_codes = &extract_response_codes_tls;
+        } else if (!strcmp(optarg, "MQTT")) {
+          extract_requests = &extract_requests_mqtt;
+          extract_response_codes = &extract_response_codes_mqtt;
         } else {
           FATAL("%s protocol is not supported yet!", optarg);
         }
