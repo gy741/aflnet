@@ -1944,46 +1944,40 @@ region_t *extract_requests_dtls12(unsigned char* buf, unsigned int buf_size, uns
 #define DLT_HTYP_WTMS 0x10 // With Timestamp (4 bytes)
 #define DLT_STORAGE_HEADER_SIZE 4 // TCP 동기화용 "DLS\x01" 크기
 
-// 1. 요청 메시지 파싱 (순정 AFLNet region_t 규격 적용)
+// 1. 요청 메시지 파싱 (순정 규격 realloc 롤백)
 region_t* extract_requests_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* count) {
     region_t* regions = NULL;
     unsigned int rcount = 0;
     unsigned int current_idx = 0;
 
-    // 최소 Storage Header(4) + Standard Header(4) = 8바이트 경계 검사
     while (current_idx + 8 <= buf_size) {
-        // TCP 스트림 동기화를 위한 "DLS\x01" 패턴 검색
         if (buf[current_idx] == 'D' && buf[current_idx+1] == 'L' && 
             buf[current_idx+2] == 'S' && buf[current_idx+3] == 0x01) {
             
             unsigned char htyp = buf[current_idx + 4];
             unsigned int msg_len = 0;
             
-            // AUTOSAR 표준 엔디안 처리 (MSBF 비트 확인)
             if (htyp & DLT_HTYP_MSBF) { 
-                msg_len = (buf[current_idx + 6] << 8) | buf[current_idx + 7]; // Big-Endian
+                msg_len = (buf[current_idx + 6] << 8) | buf[current_idx + 7];
             } else {
-                msg_len = buf[current_idx + 6] | (buf[current_idx + 7] << 8); // Little-Endian
+                msg_len = buf[current_idx + 6] | (buf[current_idx + 7] << 8);
             }
 
             unsigned int total_msg_size = DLT_STORAGE_HEADER_SIZE + msg_len;
 
-            // 유효성 검사 및 AFLNet region_t 배열에 등록
             if (msg_len >= 4 && current_idx + total_msg_size <= buf_size) {
                 regions = (region_t*)realloc(regions, (rcount + 1) * sizeof(region_t));
                 
-                // 순정 AFLNet 호환 필드 명명 규격 (.size) 적용
                 regions[rcount].start_byte = current_idx;
                 regions[rcount].size = total_msg_size; 
                 
                 rcount++;
-                current_idx += total_msg_size; // 다음 메시지로 건너뛰기
+                current_idx += total_msg_size;
                 continue;
             }
         }
-        current_idx++; // 매직 넘버 매칭 실패 시 1바이트씩 전진하며 검색
+        current_idx++;
     }
-    
     *count = rcount;
     return regions;
 }
@@ -2480,30 +2474,29 @@ unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_si
             unsigned int total_msg_size = DLT_STORAGE_HEADER_SIZE + msg_len;
             
             if (msg_len >= 4 && current_idx + total_msg_size <= buf_size) {
-                unsigned int state_code = (unsigned int)htyp;
-                int current_offset = current_idx + 8; // Headers 건너뜀
+                // 기본값: 3자리 이하 구조 유지
+                unsigned int state_code = (unsigned int)htyp; 
+                int current_offset = current_idx + 8;
                 
-                // AUTOSAR 표준 가변 필드 오프셋 계산
                 if (htyp & DLT_HTYP_WEID) current_offset += 4; 
                 if (htyp & DLT_HTYP_WSID) current_offset += 4; 
                 if (htyp & DLT_HTYP_WTMS) current_offset += 4; 
                 
-                // Extended Header(UEH) 처리
-                if (htyp & DLT_HTYP_UEH) { 
+                if ((htyp & DLT_HTYP_UEH) && (current_offset < buf_size)) { 
                     unsigned char msin = buf[current_offset];
-                    unsigned char mstp = (msin >> 1) & 0x07; // Message Type 추출
+                    unsigned char mstp = (msin >> 1) & 0x07;
                     
                     if (mstp == 0x02) { // Control Response 일 때
-                        int payload_start = current_offset + 10; // Extended Header 크기(10) 가산
-                        
+                        int payload_start = current_offset + 10;
                         if (payload_start + 5 <= current_idx + total_msg_size) {
-                            // 💡 최적화 포인트: 상태 충돌 방지를 위해 msin과 status_code를 조합
-                            state_code = (state_code << 16) | (msin << 8) | buf[payload_start + 4]; 
+                            // 💡 400번대 공간으로 압축 맵핑 (최대 405)
+                            state_code = 400 + (unsigned int)buf[payload_start + 4]; 
                         } else {
-                            state_code = (state_code << 8) | msin;
+                            state_code = 100 + (unsigned int)msin;
                         }
                     } else {
-                        state_code = (state_code << 8) | msin; 
+                        // 💡 100~300번대 공간으로 압축 맵핑 (최대 355)
+                        state_code = 100 + (unsigned int)msin; 
                     }
                 }
 
@@ -2517,7 +2510,6 @@ unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_si
         }
         current_idx++;
     }
-    
     *state_count = rcount;
     return response_codes;
 }
