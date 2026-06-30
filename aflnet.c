@@ -1937,6 +1937,13 @@ region_t *extract_requests_dtls12(unsigned char* buf, unsigned int buf_size, uns
   return regions;
 }
 
+#define DLT_HTYP_UEH  0x01 
+#define DLT_HTYP_MSBF 0x02 
+#define DLT_HTYP_WEID 0x04 
+#define DLT_HTYP_WSID 0x08 
+#define DLT_HTYP_WTMS 0x10 
+#define DLT_STORAGE_HEADER_SIZE 4 
+
 region_t* extract_requests_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref) {
     region_t* regions = NULL;
     unsigned int rcount = 0;
