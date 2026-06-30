@@ -1953,35 +1953,51 @@ region_t* extract_requests_dlt(unsigned char* buf, unsigned int buf_size, unsign
         if (buf[current_idx] == 'D' && buf[current_idx+1] == 'L' && 
             buf[current_idx+2] == 'S' && buf[current_idx+3] == 0x01) {
             
-            // 스마트 엔디안 자동 감지
+            // [핵심 방어] 버퍼 경계를 절대 넘지 않도록 최대 길이(max_len)를 먼저 계산
+            unsigned int max_len = 0;
+            if (buf_size > current_idx + DLT_STORAGE_HEADER_SIZE) {
+                max_len = buf_size - current_idx - DLT_STORAGE_HEADER_SIZE;
+            }
+            
             unsigned int msg_len_be = (buf[current_idx + 6] << 8) | buf[current_idx + 7];
             unsigned int msg_len_le = buf[current_idx + 6] | (buf[current_idx + 7] << 8);
             unsigned int msg_len = 0;
 
-            if (msg_len_be >= 4 && (current_idx + DLT_STORAGE_HEADER_SIZE + msg_len_be) <= buf_size) {
+            // [핵심 방어] max_len을 초과하는 길이는 무조건 폐기 (Heap Overflow 원천 차단)
+            if (msg_len_be >= 4 && msg_len_be <= max_len) {
                 msg_len = msg_len_be;
-            } else if (msg_len_le >= 4 && (current_idx + DLT_STORAGE_HEADER_SIZE + msg_len_le) <= buf_size) {
+            } else if (msg_len_le >= 4 && msg_len_le <= max_len) {
                 msg_len = msg_len_le;
             } else {
-                msg_len = msg_len_be; 
+                current_idx++;
+                continue;
             }
 
             unsigned int total_msg_size = DLT_STORAGE_HEADER_SIZE + msg_len;
 
-            if (msg_len >= 4 && current_idx + total_msg_size <= buf_size) {
-                regions = (region_t*)realloc(regions, (rcount + 1) * sizeof(region_t));
-                regions[rcount].start_byte = current_idx;
-                regions[rcount].end_byte = current_idx + total_msg_size - 1; 
-                regions[rcount].modifiable = 1;
-                regions[rcount].state_sequence = NULL;
-                regions[rcount].state_count = 0;
-                
-                rcount++;
-                current_idx += total_msg_size; 
-                continue;
-            }
+            regions = (region_t*)realloc(regions, (rcount + 1) * sizeof(region_t));
+            regions[rcount].start_byte = current_idx;
+            regions[rcount].end_byte = current_idx + total_msg_size - 1; 
+            regions[rcount].modifiable = 1;
+            regions[rcount].state_sequence = NULL;
+            regions[rcount].state_count = 0;
+            
+            rcount++;
+            current_idx += total_msg_size; 
+            continue;
         }
         current_idx++; 
+    }
+    
+    // [방어선] 파싱 실패 시 전체 버퍼를 하나의 영역으로 반환 (AFLNet 크래시 방지)
+    if (rcount == 0 && buf_size > 0) {
+        regions = (region_t*)malloc(sizeof(region_t));
+        regions[0].start_byte = 0;
+        regions[0].end_byte = buf_size - 1;
+        regions[0].modifiable = 1;
+        regions[0].state_sequence = NULL;
+        regions[0].state_count = 0;
+        rcount = 1;
     }
     
     *region_count_ref = rcount;
@@ -2461,11 +2477,11 @@ unsigned int* extract_response_codes_ipp(unsigned char* buf, unsigned int buf_si
 }
 
 // 2. 응답 상태 코드 추출 (AFLNet 초기 상태 등록 문제 해결본)
+
 unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref) {
-    
     if (buf_size == 0) {
         unsigned int* response_codes = (unsigned int*)malloc(sizeof(unsigned int));
-        response_codes[0] = 0; // DLT Initial State (No Banner)
+        response_codes[0] = 0;
         *state_count_ref = 1;
         return response_codes;
     }
@@ -2478,37 +2494,49 @@ unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_si
         if (buf[current_idx] == 'D' && buf[current_idx+1] == 'L' && 
             buf[current_idx+2] == 'S' && buf[current_idx+3] == 0x01) {
             
+            // [핵심 방어] 버퍼 경계를 절대 넘지 않도록 최대 길이(max_len)를 먼저 계산
+            unsigned int max_len = 0;
+            if (buf_size > current_idx + DLT_STORAGE_HEADER_SIZE) {
+                max_len = buf_size - current_idx - DLT_STORAGE_HEADER_SIZE;
+            }
+            
             unsigned int msg_len_be = (buf[current_idx + 6] << 8) | buf[current_idx + 7];
             unsigned int msg_len_le = buf[current_idx + 6] | (buf[current_idx + 7] << 8);
             unsigned int msg_len = 0;
 
-            if (msg_len_be >= 4 && (current_idx + DLT_STORAGE_HEADER_SIZE + msg_len_be) <= buf_size) {
+            if (msg_len_be >= 4 && msg_len_be <= max_len) {
                 msg_len = msg_len_be;
-            } else if (msg_len_le >= 4 && (current_idx + DLT_STORAGE_HEADER_SIZE + msg_len_le) <= buf_size) {
+            } else if (msg_len_le >= 4 && msg_len_le <= max_len) {
                 msg_len = msg_len_le;
             } else {
-                msg_len = msg_len_be; 
+                current_idx++;
+                continue;
             }
             
             unsigned int total_msg_size = DLT_STORAGE_HEADER_SIZE + msg_len;
             
-            if (msg_len >= 4 && current_idx + total_msg_size <= buf_size) {
-                unsigned int state_code = (buf[current_idx + 4] << 24) | 
-                                          (buf[current_idx + 5] << 16) | 
-                                          (buf[current_idx + 6] << 8)  | 
-                                          buf[current_idx + 7];
+            // Header Signature 방식 (오프셋 계산 오류 원천 차단)
+            unsigned int state_code = (buf[current_idx + 4] << 24) | 
+                                      (buf[current_idx + 5] << 16) | 
+                                      (buf[current_idx + 6] << 8)  | 
+                                      buf[current_idx + 7];
 
-                response_codes = (unsigned int*)realloc(response_codes, (rcount + 1) * sizeof(unsigned int));
-                response_codes[rcount] = state_code;
-                rcount++;
-                
-                current_idx += total_msg_size;
-                continue;
+            // AFLNet 초기 상태(Initial State) 등록 조건 충족
+            if (rcount == 0) {
+                state_code = 0; 
             }
+
+            response_codes = (unsigned int*)realloc(response_codes, (rcount + 1) * sizeof(unsigned int));
+            response_codes[rcount] = state_code;
+            rcount++;
+            
+            current_idx += total_msg_size;
+            continue;
         }
         current_idx++;
     }
     
+    // [방어선] 파싱 실패 시 더미 상태 반환
     if (rcount == 0) {
         response_codes = (unsigned int*)malloc(sizeof(unsigned int));
         response_codes[0] = 0; 
@@ -2518,6 +2546,7 @@ unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_si
     *state_count_ref = rcount;
     return response_codes;
 }
+
 // kl_messages manipulating functions
 
 klist_t(lms) *construct_kl_messages(u8* fname, region_t *regions, u32 region_count)
