@@ -1937,73 +1937,56 @@ region_t *extract_requests_dtls12(unsigned char* buf, unsigned int buf_size, uns
   return regions;
 }
 
-#define DLT_HTYP_UEH  0x01 
-#define DLT_HTYP_MSBF 0x02 
-#define DLT_HTYP_WEID 0x04 
-#define DLT_HTYP_WSID 0x08 
-#define DLT_HTYP_WTMS 0x10 
-#define DLT_STORAGE_HEADER_SIZE 4 
+#define DLT_HTYP_UEH  0x01 // Use Extended Header
+#define DLT_HTYP_MSBF 0x02 // MSB First (1: Big-Endian, 0: Little-Endian)
+#define DLT_HTYP_WEID 0x04 // With ECU ID (4 bytes)
+#define DLT_HTYP_WSID 0x08 // With Session ID (4 bytes)
+#define DLT_HTYP_WTMS 0x10 // With Timestamp (4 bytes)
+#define DLT_STORAGE_HEADER_SIZE 4 // TCP 동기화용 "DLS\x01" 크기
 
-region_t* extract_requests_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref) {
+// 1. 요청 메시지 파싱 (순정 AFLNet region_t 규격 적용)
+region_t* extract_requests_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* count) {
     region_t* regions = NULL;
     unsigned int rcount = 0;
     unsigned int current_idx = 0;
 
+    // 최소 Storage Header(4) + Standard Header(4) = 8바이트 경계 검사
     while (current_idx + 8 <= buf_size) {
+        // TCP 스트림 동기화를 위한 "DLS\x01" 패턴 검색
         if (buf[current_idx] == 'D' && buf[current_idx+1] == 'L' && 
             buf[current_idx+2] == 'S' && buf[current_idx+3] == 0x01) {
             
-            // [핵심 방어] 버퍼 경계를 절대 넘지 않도록 최대 길이(max_len)를 먼저 계산
-            unsigned int max_len = 0;
-            if (buf_size > current_idx + DLT_STORAGE_HEADER_SIZE) {
-                max_len = buf_size - current_idx - DLT_STORAGE_HEADER_SIZE;
-            }
-            
-            unsigned int msg_len_be = (buf[current_idx + 6] << 8) | buf[current_idx + 7];
-            unsigned int msg_len_le = buf[current_idx + 6] | (buf[current_idx + 7] << 8);
+            unsigned char htyp = buf[current_idx + 4];
             unsigned int msg_len = 0;
-
-            // [핵심 방어] max_len을 초과하는 길이는 무조건 폐기 (Heap Overflow 원천 차단)
-            if (msg_len_be >= 4 && msg_len_be <= max_len) {
-                msg_len = msg_len_be;
-            } else if (msg_len_le >= 4 && msg_len_le <= max_len) {
-                msg_len = msg_len_le;
+            
+            // AUTOSAR 표준 엔디안 처리 (MSBF 비트 확인)
+            if (htyp & DLT_HTYP_MSBF) { 
+                msg_len = (buf[current_idx + 6] << 8) | buf[current_idx + 7]; // Big-Endian
             } else {
-                current_idx++;
-                continue;
+                msg_len = buf[current_idx + 6] | (buf[current_idx + 7] << 8); // Little-Endian
             }
 
             unsigned int total_msg_size = DLT_STORAGE_HEADER_SIZE + msg_len;
 
-            regions = (region_t*)realloc(regions, (rcount + 1) * sizeof(region_t));
-            regions[rcount].start_byte = current_idx;
-            regions[rcount].end_byte = current_idx + total_msg_size - 1; 
-            regions[rcount].modifiable = 1;
-            regions[rcount].state_sequence = NULL;
-            regions[rcount].state_count = 0;
-            
-            rcount++;
-            current_idx += total_msg_size; 
-            continue;
+            // 유효성 검사 및 AFLNet region_t 배열에 등록
+            if (msg_len >= 4 && current_idx + total_msg_size <= buf_size) {
+                regions = (region_t*)realloc(regions, (rcount + 1) * sizeof(region_t));
+                
+                // 순정 AFLNet 호환 필드 명명 규격 (.size) 적용
+                regions[rcount].start_byte = current_idx;
+                regions[rcount].size = total_msg_size; 
+                
+                rcount++;
+                current_idx += total_msg_size; // 다음 메시지로 건너뛰기
+                continue;
+            }
         }
-        current_idx++; 
+        current_idx++; // 매직 넘버 매칭 실패 시 1바이트씩 전진하며 검색
     }
     
-    // [방어선] 파싱 실패 시 전체 버퍼를 하나의 영역으로 반환 (AFLNet 크래시 방지)
-    if (rcount == 0 && buf_size > 0) {
-        regions = (region_t*)malloc(sizeof(region_t));
-        regions[0].start_byte = 0;
-        regions[0].end_byte = buf_size - 1;
-        regions[0].modifiable = 1;
-        regions[0].state_sequence = NULL;
-        regions[0].state_count = 0;
-        rcount = 1;
-    }
-    
-    *region_count_ref = rcount;
+    *count = rcount;
     return regions;
 }
-
 
 
 // a status code comprises <content_type, message_type> tuples
@@ -2476,16 +2459,7 @@ unsigned int* extract_response_codes_ipp(unsigned char* buf, unsigned int buf_si
   return state_sequence;
 }
 
-// 2. 응답 상태 코드 추출 (AFLNet 초기 상태 등록 문제 해결본)
-
-unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref) {
-    if (buf_size == 0) {
-        unsigned int* response_codes = (unsigned int*)malloc(sizeof(unsigned int));
-        response_codes[0] = 0;
-        *state_count_ref = 1;
-        return response_codes;
-    }
-
+unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* state_count) {
     unsigned int* response_codes = NULL;
     unsigned int rcount = 0;
     unsigned int current_idx = 0;
@@ -2494,56 +2468,57 @@ unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_si
         if (buf[current_idx] == 'D' && buf[current_idx+1] == 'L' && 
             buf[current_idx+2] == 'S' && buf[current_idx+3] == 0x01) {
             
-            // [핵심 방어] 버퍼 경계를 절대 넘지 않도록 최대 길이(max_len)를 먼저 계산
-            unsigned int max_len = 0;
-            if (buf_size > current_idx + DLT_STORAGE_HEADER_SIZE) {
-                max_len = buf_size - current_idx - DLT_STORAGE_HEADER_SIZE;
-            }
-            
-            unsigned int msg_len_be = (buf[current_idx + 6] << 8) | buf[current_idx + 7];
-            unsigned int msg_len_le = buf[current_idx + 6] | (buf[current_idx + 7] << 8);
+            unsigned char htyp = buf[current_idx + 4];
             unsigned int msg_len = 0;
-
-            if (msg_len_be >= 4 && msg_len_be <= max_len) {
-                msg_len = msg_len_be;
-            } else if (msg_len_le >= 4 && msg_len_le <= max_len) {
-                msg_len = msg_len_le;
+            
+            if (htyp & DLT_HTYP_MSBF) { 
+                msg_len = (buf[current_idx + 6] << 8) | buf[current_idx + 7];
             } else {
-                current_idx++;
-                continue;
+                msg_len = buf[current_idx + 6] | (buf[current_idx + 7] << 8);
             }
             
             unsigned int total_msg_size = DLT_STORAGE_HEADER_SIZE + msg_len;
             
-            // Header Signature 방식 (오프셋 계산 오류 원천 차단)
-            unsigned int state_code = (buf[current_idx + 4] << 24) | 
-                                      (buf[current_idx + 5] << 16) | 
-                                      (buf[current_idx + 6] << 8)  | 
-                                      buf[current_idx + 7];
+            if (msg_len >= 4 && current_idx + total_msg_size <= buf_size) {
+                unsigned int state_code = (unsigned int)htyp;
+                int current_offset = current_idx + 8; // Headers 건너뜀
+                
+                // AUTOSAR 표준 가변 필드 오프셋 계산
+                if (htyp & DLT_HTYP_WEID) current_offset += 4; 
+                if (htyp & DLT_HTYP_WSID) current_offset += 4; 
+                if (htyp & DLT_HTYP_WTMS) current_offset += 4; 
+                
+                // Extended Header(UEH) 처리
+                if (htyp & DLT_HTYP_UEH) { 
+                    unsigned char msin = buf[current_offset];
+                    unsigned char mstp = (msin >> 1) & 0x07; // Message Type 추출
+                    
+                    if (mstp == 0x02) { // Control Response 일 때
+                        int payload_start = current_offset + 10; // Extended Header 크기(10) 가산
+                        
+                        if (payload_start + 5 <= current_idx + total_msg_size) {
+                            // 💡 최적화 포인트: 상태 충돌 방지를 위해 msin과 status_code를 조합
+                            state_code = (state_code << 16) | (msin << 8) | buf[payload_start + 4]; 
+                        } else {
+                            state_code = (state_code << 8) | msin;
+                        }
+                    } else {
+                        state_code = (state_code << 8) | msin; 
+                    }
+                }
 
-            // AFLNet 초기 상태(Initial State) 등록 조건 충족
-            if (rcount == 0) {
-                state_code = 0; 
+                response_codes = (unsigned int*)realloc(response_codes, (rcount + 1) * sizeof(unsigned int));
+                response_codes[rcount] = state_code;
+                rcount++;
+                
+                current_idx += total_msg_size;
+                continue;
             }
-
-            response_codes = (unsigned int*)realloc(response_codes, (rcount + 1) * sizeof(unsigned int));
-            response_codes[rcount] = state_code;
-            rcount++;
-            
-            current_idx += total_msg_size;
-            continue;
         }
         current_idx++;
     }
     
-    // [방어선] 파싱 실패 시 더미 상태 반환
-    if (rcount == 0) {
-        response_codes = (unsigned int*)malloc(sizeof(unsigned int));
-        response_codes[0] = 0; 
-        rcount = 1;
-    }
-    
-    *state_count_ref = rcount;
+    *state_count = rcount;
     return response_codes;
 }
 
