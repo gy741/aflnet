@@ -1944,6 +1944,7 @@ region_t *extract_requests_dtls12(unsigned char* buf, unsigned int buf_size, uns
 #define DLT_HTYP_WTMS 0x10 
 #define DLT_STORAGE_HEADER_SIZE 4 
 
+// 1. 요청 메시지 파싱 (시드 파일을 쪼개어 큐에 적재)
 region_t* extract_requests_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref) {
     region_t* regions = NULL;
     unsigned int rcount = 0;
@@ -1954,12 +1955,18 @@ region_t* extract_requests_dlt(unsigned char* buf, unsigned int buf_size, unsign
             buf[current_idx+2] == 'S' && buf[current_idx+3] == 0x01) {
             
             unsigned char htyp = buf[current_idx + 4];
-            unsigned int msg_len = 0;
             
-            if (htyp & DLT_HTYP_MSBF) { 
-                msg_len = (buf[current_idx + 6] << 8) | buf[current_idx + 7];
+            // [수정됨] 스마트 엔디안 자동 감지 로직 (MSBF 비트 무관하게 유효한 길이 선택)
+            unsigned int msg_len_be = (buf[current_idx + 6] << 8) | buf[current_idx + 7];
+            unsigned int msg_len_le = buf[current_idx + 6] | (buf[current_idx + 7] << 8);
+            unsigned int msg_len = 0;
+
+            if (msg_len_be >= 4 && (current_idx + DLT_STORAGE_HEADER_SIZE + msg_len_be) <= buf_size) {
+                msg_len = msg_len_be;
+            } else if (msg_len_le >= 4 && (current_idx + DLT_STORAGE_HEADER_SIZE + msg_len_le) <= buf_size) {
+                msg_len = msg_len_le;
             } else {
-                msg_len = buf[current_idx + 6] | (buf[current_idx + 7] << 8);
+                msg_len = msg_len_be; // Fallback
             }
 
             unsigned int total_msg_size = DLT_STORAGE_HEADER_SIZE + msg_len;
@@ -1983,6 +1990,7 @@ region_t* extract_requests_dlt(unsigned char* buf, unsigned int buf_size, unsign
     *region_count_ref = rcount;
     return regions;
 }
+
 
 // a status code comprises <content_type, message_type> tuples
 // message_type varies depending on content_type (e.g. for handshake content, message_type is the handshake message type...)
@@ -2464,12 +2472,18 @@ unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_si
             buf[current_idx+2] == 'S' && buf[current_idx+3] == 0x01) {
             
             unsigned char htyp = buf[current_idx + 4];
-            unsigned int msg_len = 0;
             
-            if (htyp & DLT_HTYP_MSBF) { 
-                msg_len = (buf[current_idx + 6] << 8) | buf[current_idx + 7];
+            // [수정됨] 스마트 엔디안 자동 감지 로직
+            unsigned int msg_len_be = (buf[current_idx + 6] << 8) | buf[current_idx + 7];
+            unsigned int msg_len_le = buf[current_idx + 6] | (buf[current_idx + 7] << 8);
+            unsigned int msg_len = 0;
+
+            if (msg_len_be >= 4 && (current_idx + DLT_STORAGE_HEADER_SIZE + msg_len_be) <= buf_size) {
+                msg_len = msg_len_be;
+            } else if (msg_len_le >= 4 && (current_idx + DLT_STORAGE_HEADER_SIZE + msg_len_le) <= buf_size) {
+                msg_len = msg_len_le;
             } else {
-                msg_len = buf[current_idx + 6] | (buf[current_idx + 7] << 8);
+                msg_len = msg_len_be; // Fallback
             }
             
             unsigned int total_msg_size = DLT_STORAGE_HEADER_SIZE + msg_len;
@@ -2484,12 +2498,19 @@ unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_si
                 
                 if (htyp & DLT_HTYP_UEH) { 
                     unsigned char msin = buf[current_offset];
-                    unsigned char mstp = (msin >> 1) & 0x07; 
                     
-                    if (mstp == 0x02) { 
-                        int payload_start = current_offset + 10;
-                        if (payload_start + 5 <= current_idx + total_msg_size) {
-                            state_code = (unsigned int)buf[payload_start + 4]; 
+                    // [수정됨] AUTOSAR DLT 표준 MSIN 비트 구조 정확히 반영
+                    unsigned char mstp = (msin >> 4) & 0x07; 
+                    unsigned char mtin = msin & 0x0F;
+                    
+                    if (mstp == 0x03) { // DLT_TYPE_CONTROL
+                        if (mtin == 0x02) { // DLT_CONTROL_RESPONSE
+                            int payload_start = current_offset + 10; 
+                            if (payload_start + 5 <= current_idx + total_msg_size) {
+                                state_code = (unsigned int)buf[payload_start + 4]; // 실제 Status Code 추출
+                            } else {
+                                state_code = msin; 
+                            }
                         } else {
                             state_code = msin; 
                         }
