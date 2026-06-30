@@ -2460,7 +2460,16 @@ unsigned int* extract_response_codes_ipp(unsigned char* buf, unsigned int buf_si
   return state_sequence;
 }
 
+// 2. 응답 상태 코드 추출 (AFLNet 초기 상태 등록 문제 해결본)
 unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref) {
+    
+    if (buf_size == 0) {
+        unsigned int* response_codes = (unsigned int*)malloc(sizeof(unsigned int));
+        response_codes[0] = 0; // DLT Initial State (No Banner)
+        *state_count_ref = 1;
+        return response_codes;
+    }
+
     unsigned int* response_codes = NULL;
     unsigned int rcount = 0;
     unsigned int current_idx = 0;
@@ -2500,16 +2509,15 @@ unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_si
         current_idx++;
     }
     
-    if (rcount == 0 && buf_size > 0) {
+    if (rcount == 0) {
         response_codes = (unsigned int*)malloc(sizeof(unsigned int));
-        response_codes[0] = 0x99999999; // Dummy Initial State
+        response_codes[0] = 0; 
         rcount = 1;
     }
     
     *state_count_ref = rcount;
     return response_codes;
 }
-
 // kl_messages manipulating functions
 
 klist_t(lms) *construct_kl_messages(u8* fname, region_t *regions, u32 region_count)
