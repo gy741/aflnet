@@ -1937,6 +1937,46 @@ region_t *extract_requests_dtls12(unsigned char* buf, unsigned int buf_size, uns
   return regions;
 }
 
+region_t* extract_requests_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref) {
+    region_t* regions = NULL;
+    unsigned int rcount = 0;
+    unsigned int current_idx = 0;
+
+    while (current_idx + 8 <= buf_size) {
+        if (buf[current_idx] == 'D' && buf[current_idx+1] == 'L' && 
+            buf[current_idx+2] == 'S' && buf[current_idx+3] == 0x01) {
+            
+            unsigned char htyp = buf[current_idx + 4];
+            unsigned int msg_len = 0;
+            
+            if (htyp & DLT_HTYP_MSBF) { 
+                msg_len = (buf[current_idx + 6] << 8) | buf[current_idx + 7];
+            } else {
+                msg_len = buf[current_idx + 6] | (buf[current_idx + 7] << 8);
+            }
+
+            unsigned int total_msg_size = DLT_STORAGE_HEADER_SIZE + msg_len;
+
+            if (msg_len >= 4 && current_idx + total_msg_size <= buf_size) {
+                regions = (region_t*)realloc(regions, (rcount + 1) * sizeof(region_t));
+                regions[rcount].start_byte = current_idx;
+                regions[rcount].end_byte = current_idx + total_msg_size - 1; 
+                regions[rcount].modifiable = 1;
+                regions[rcount].state_sequence = NULL;
+                regions[rcount].state_count = 0;
+                
+                rcount++;
+                current_idx += total_msg_size; 
+                continue;
+            }
+        }
+        current_idx++; 
+    }
+    
+    *region_count_ref = rcount;
+    return regions;
+}
+
 // a status code comprises <content_type, message_type> tuples
 // message_type varies depending on content_type (e.g. for handshake content, message_type is the handshake message type...)
 //
@@ -2406,6 +2446,68 @@ unsigned int* extract_response_codes_ipp(unsigned char* buf, unsigned int buf_si
   *state_count_ref = state_count;
   return state_sequence;
 }
+
+unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref) {
+    unsigned int* response_codes = NULL;
+    unsigned int rcount = 0;
+    unsigned int current_idx = 0;
+
+    while (current_idx + 8 <= buf_size) {
+        if (buf[current_idx] == 'D' && buf[current_idx+1] == 'L' && 
+            buf[current_idx+2] == 'S' && buf[current_idx+3] == 0x01) {
+            
+            unsigned char htyp = buf[current_idx + 4];
+            unsigned int msg_len = 0;
+            
+            if (htyp & DLT_HTYP_MSBF) { 
+                msg_len = (buf[current_idx + 6] << 8) | buf[current_idx + 7];
+            } else {
+                msg_len = buf[current_idx + 6] | (buf[current_idx + 7] << 8);
+            }
+            
+            unsigned int total_msg_size = DLT_STORAGE_HEADER_SIZE + msg_len;
+            
+            if (msg_len >= 4 && current_idx + total_msg_size <= buf_size) {
+                unsigned int state_code = 0;
+                int current_offset = current_idx + 8; 
+                
+                if (htyp & DLT_HTYP_WEID) current_offset += 4; 
+                if (htyp & DLT_HTYP_WSID) current_offset += 4; 
+                if (htyp & DLT_HTYP_WTMS) current_offset += 4; 
+                
+                if (htyp & DLT_HTYP_UEH) { 
+                    unsigned char msin = buf[current_offset];
+                    unsigned char mstp = (msin >> 1) & 0x07; 
+                    
+                    if (mstp == 0x02) { 
+                        int payload_start = current_offset + 10;
+                        if (payload_start + 5 <= current_idx + total_msg_size) {
+                            state_code = (unsigned int)buf[payload_start + 4]; 
+                        } else {
+                            state_code = msin; 
+                        }
+                    } else {
+                        state_code = msin; 
+                    }
+                } else {
+                    state_code = htyp; 
+                }
+
+                response_codes = (unsigned int*)realloc(response_codes, (rcount + 1) * sizeof(unsigned int));
+                response_codes[rcount] = state_code;
+                rcount++;
+                
+                current_idx += total_msg_size;
+                continue;
+            }
+        }
+        current_idx++;
+    }
+    
+    *state_count_ref = rcount;
+    return response_codes;
+}
+
 
 // kl_messages manipulating functions
 
