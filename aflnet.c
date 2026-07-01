@@ -1937,51 +1937,48 @@ region_t *extract_requests_dtls12(unsigned char* buf, unsigned int buf_size, uns
   return regions;
 }
 
-#define DLT_HTYP_UEH  0x01 // Use Extended Header
-#define DLT_HTYP_MSBF 0x02 // MSB First (1: Big-Endian, 0: Little-Endian)
-#define DLT_HTYP_WEID 0x04 // With ECU ID (4 bytes)
-#define DLT_HTYP_WSID 0x08 // With Session ID (4 bytes)
-#define DLT_HTYP_WTMS 0x10 // With Timestamp (4 bytes)
-#define DLT_STORAGE_HEADER_SIZE 4 // TCP 동기화용 "DLS\x01" 크기
+region_t* extract_requests_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+    region_t *regions = NULL;
+    unsigned int region_count = 0;
+    unsigned int cur = 0;
 
-// 1. 요청 메시지 파싱 (순정 규격 realloc 롤백)
-region_t* extract_requests_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* count) {
-    region_t* regions = NULL;
-    unsigned int rcount = 0;
-    unsigned int current_idx = 0;
+    while (cur + 4 <= buf_size) {
+        unsigned int msg_len = read_bytes_to_uint32(buf, cur + 2, 2); /* big-endian */
+        unsigned int end;                                             /* exclusive */
 
-    while (current_idx + 8 <= buf_size) {
-        if (buf[current_idx] == 'D' && buf[current_idx+1] == 'L' && 
-            buf[current_idx+2] == 'S' && buf[current_idx+3] == 0x01) {
-            
-            unsigned char htyp = buf[current_idx + 4];
-            unsigned int msg_len = 0;
-            
-            if (htyp & DLT_HTYP_MSBF) { 
-                msg_len = (buf[current_idx + 6] << 8) | buf[current_idx + 7];
-            } else {
-                msg_len = buf[current_idx + 6] | (buf[current_idx + 7] << 8);
-            }
+        if (msg_len < 4 || cur + msg_len > buf_size)
+            end = buf_size;               /* malformed/truncated -> take the rest */
+        else
+            end = cur + msg_len;
 
-            unsigned int total_msg_size = DLT_STORAGE_HEADER_SIZE + msg_len;
+        region_count++;
+        regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
+        regions[region_count - 1].start_byte = cur;
+        regions[region_count - 1].end_byte = end - 1; /* inclusive */
+        regions[region_count - 1].state_sequence = NULL;
+        regions[region_count - 1].state_count = 0;
 
-            if (msg_len >= 4 && current_idx + total_msg_size <= buf_size) {
-                regions = (region_t*)realloc(regions, (rcount + 1) * sizeof(region_t));
-                
-                regions[rcount].start_byte = current_idx;
-                regions[rcount].size = total_msg_size; 
-                
-                rcount++;
-                current_idx += total_msg_size;
-                continue;
-            }
-        }
-        current_idx++;
+        cur = end;
     }
-    *count = rcount;
+
+    /* absorb trailing bytes (1..3 leftover) into the last region */
+    if (cur < buf_size && region_count > 0)
+        regions[region_count - 1].end_byte = buf_size - 1;
+
+    /* fallback: whole buffer as a single region */
+    if (region_count == 0 && buf_size > 0) {
+        region_count = 1;
+        regions = (region_t *)ck_realloc(regions, sizeof(region_t));
+        regions[0].start_byte = 0;
+        regions[0].end_byte = buf_size - 1;
+        regions[0].state_sequence = NULL;
+        regions[0].state_count = 0;
+    }
+
+    *region_count_ref = region_count;
     return regions;
 }
-
 
 // a status code comprises <content_type, message_type> tuples
 // message_type varies depending on content_type (e.g. for handshake content, message_type is the handshake message type...)
@@ -2453,65 +2450,62 @@ unsigned int* extract_response_codes_ipp(unsigned char* buf, unsigned int buf_si
   return state_sequence;
 }
 
-unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* state_count) {
-    unsigned int* response_codes = NULL;
-    unsigned int rcount = 0;
-    unsigned int current_idx = 0;
+unsigned int* extract_response_codes_dlt(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+    unsigned int *state_sequence = NULL;
+    unsigned int state_count = 0;
+    unsigned int cur = 0;
 
-    while (current_idx + 8 <= buf_size) {
-        if (buf[current_idx] == 'D' && buf[current_idx+1] == 'L' && 
-            buf[current_idx+2] == 'S' && buf[current_idx+3] == 0x01) {
-            
-            unsigned char htyp = buf[current_idx + 4];
-            unsigned int msg_len = 0;
-            
-            if (htyp & DLT_HTYP_MSBF) { 
-                msg_len = (buf[current_idx + 6] << 8) | buf[current_idx + 7];
-            } else {
-                msg_len = buf[current_idx + 6] | (buf[current_idx + 7] << 8);
-            }
-            
-            unsigned int total_msg_size = DLT_STORAGE_HEADER_SIZE + msg_len;
-            
-            if (msg_len >= 4 && current_idx + total_msg_size <= buf_size) {
-                // 기본값: 3자리 이하 구조 유지
-                unsigned int state_code = (unsigned int)htyp; 
-                int current_offset = current_idx + 8;
-                
-                if (htyp & DLT_HTYP_WEID) current_offset += 4; 
-                if (htyp & DLT_HTYP_WSID) current_offset += 4; 
-                if (htyp & DLT_HTYP_WTMS) current_offset += 4; 
-                
-                if ((htyp & DLT_HTYP_UEH) && (current_offset < buf_size)) { 
-                    unsigned char msin = buf[current_offset];
-                    unsigned char mstp = (msin >> 1) & 0x07;
-                    
-                    if (mstp == 0x02) { // Control Response 일 때
-                        int payload_start = current_offset + 10;
-                        if (payload_start + 5 <= current_idx + total_msg_size) {
-                            // 💡 400번대 공간으로 압축 맵핑 (최대 405)
-                            state_code = 400 + (unsigned int)buf[payload_start + 4]; 
-                        } else {
-                            state_code = 100 + (unsigned int)msin;
-                        }
-                    } else {
-                        // 💡 100~300번대 공간으로 압축 맵핑 (최대 355)
-                        state_code = 100 + (unsigned int)msin; 
+    state_count++;                             /* initial state 0 (convention) */
+    state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+    state_sequence[state_count - 1] = 0;
+
+    while (cur + 4 <= buf_size) {
+        unsigned char htyp = buf[cur];
+        unsigned int msg_len = read_bytes_to_uint32(buf, cur + 2, 2); /* big-endian */
+        if (msg_len < 4 || cur + msg_len > buf_size) break;
+
+        /* extended-header offset = 4 + standard-header-extra size (per htyp) */
+        unsigned int off = 4;
+        if (htyp & 0x04) off += 4;    /* WEID */
+        if (htyp & 0x08) off += 4;    /* WSID */
+        if (htyp & 0x10) off += 4;    /* WTMS */
+
+        unsigned int state;
+        if ((htyp & 0x01) && off + 10 <= msg_len && cur + off + 10 <= buf_size) {
+            unsigned char msin = buf[cur + off];        /* extended header: msin */
+            unsigned int mstp = (msin & 0x0e) >> 1;     /* message type */
+            unsigned int mtin = (msin & 0xf0) >> 4;     /* message type info */
+
+            if (mstp == 0x03) {                         /* DLT_TYPE_CONTROL */
+                unsigned int p = cur + off + 10;        /* payload (after ext header) */
+                if (p + 4 <= buf_size) {
+                    unsigned int sid = read_bytes_to_uint32(buf, p, 4); /* service id */
+                    if (mtin == 0x02 && p + 5 <= buf_size) {    /* control RESPONSE (+status) */
+                        state = 0x20000u | ((sid & 0xfffu) << 4) | (buf[p + 4] & 0xfu);
+                    } else {                                    /* control request/time */
+                        state = 0x10000u | (sid & 0xffffu);
                     }
+                } else {
+                    state = 0x08000u | (mstp << 8) | mtin;      /* control but no payload */
                 }
-
-                response_codes = (unsigned int*)realloc(response_codes, (rcount + 1) * sizeof(unsigned int));
-                response_codes[rcount] = state_code;
-                rcount++;
-                
-                current_idx += total_msg_size;
-                continue;
+            } else {
+                state = 0x08000u | (mstp << 8) | mtin;          /* non-control (log/trace) */
             }
+        } else {
+            state = 0x30000u | htyp;                    /* no extended header */
         }
-        current_idx++;
+
+        state = get_mapped_message_code(state);         /* compact (like DNS) */
+        state_count++;
+        state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+        state_sequence[state_count - 1] = state;
+
+        cur += msg_len;
     }
-    *state_count = rcount;
-    return response_codes;
+
+    *state_count_ref = state_count;
+    return state_sequence;
 }
 
 // kl_messages manipulating functions
